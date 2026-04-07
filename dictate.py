@@ -72,27 +72,7 @@ def bootstrap():
         ])
         os.execv(sys.executable, [sys.executable, __file__] + sys.argv[1:])
 
-    # Pre-download default whisper model
-    whisper_marker = os.path.join(MODELS_DIR, ".whisper-tiny-ready")
-    if not os.path.exists(whisper_marker):
-        print("Downloading whisper-tiny model (~75MB, first run only)...")
-        import tempfile
-        import wave
-        import numpy as np
-        import mlx_whisper
-
-        silent = np.zeros(16000, dtype=np.float32)
-        audio_int16 = (silent * 32767).astype(np.int16)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-            with wave.open(f.name, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(audio_int16.tobytes())
-            mlx_whisper.transcribe(f.name, path_or_hf_repo="mlx-community/whisper-tiny")
-        os.makedirs(MODELS_DIR, exist_ok=True)
-        open(whisper_marker, "w").close()
-        print("  Model cached.")
+    # Model downloading/warm-up happens in background after GUI starts
 
 
 # ── Bootstrap before importing anything heavy ────────────────────────
