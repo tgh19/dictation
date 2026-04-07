@@ -30,40 +30,35 @@ VENV_DIR = os.path.join(DATA_DIR, ".venv")
 VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
 
-REQUIRED_PACKAGES = [
-    "mlx-whisper",
-    "sounddevice",
-    "numpy",
-    "pynput",
-    "rumps",
-    "ctranslate2",
-    "transformers",
-    "sentencepiece",
-    "protobuf",
-]
+# pip-name → import-name (only where they differ)
+REQUIRED_PACKAGES = {
+    "mlx-whisper": "mlx_whisper",
+    "sounddevice": "sounddevice",
+    "numpy": "numpy",
+    "pynput": "pynput",
+    "rumps": "rumps",
+    "ctranslate2": "ctranslate2",
+    "transformers": "transformers",
+    "sentencepiece": "sentencepiece",
+    "protobuf": "google.protobuf",
+}
 
 
 def bootstrap():
     """Ensure venv and packages are ready. Auto-fixes anything missing."""
-    # If not running inside our venv, create it and re-exec
-    if sys.prefix == sys.base_prefix or not sys.executable.startswith(VENV_DIR):
+    if sys.prefix == sys.base_prefix:
         if not os.path.exists(VENV_PYTHON):
-            print("Creating virtual environment (first run)...")
             subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
-        print("Activating virtual environment...")
         os.execv(VENV_PYTHON, [VENV_PYTHON, __file__] + sys.argv[1:])
 
-    # Inside venv — check packages
     missing = []
-    for pkg in REQUIRED_PACKAGES:
-        import_name = pkg.replace("-", "_")
+    for pip_name, import_name in REQUIRED_PACKAGES.items():
         try:
             __import__(import_name)
         except ImportError:
-            missing.append(pkg)
+            missing.append(pip_name)
 
     if missing:
-        print(f"Installing packages: {', '.join(missing)}...")
         subprocess.check_call([
             sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip",
         ])
@@ -278,17 +273,12 @@ class DictationApp(rumps.App):
     # ── Model Loading ────────────────────────────────────────────────
 
     def _load_whisper(self):
-        model_repo = WHISPER_MODELS[self.whisper_model_key]
         self.status_item.title = f"Status: Loading {self.whisper_model_key}..."
         try:
-            import mlx_whisper
-            silent = np.zeros(SAMPLE_RATE, dtype=np.float32)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-                _write_wav(f.name, silent)
-                mlx_whisper.transcribe(f.name, path_or_hf_repo=model_repo)
+            import mlx_whisper  # noqa: F401 — ensure module is importable
             self.model_ready = True
             self._update_status_ready()
-            print(f"Whisper model '{self.whisper_model_key}' loaded.")
+            print(f"Whisper model '{self.whisper_model_key}' ready.")
         except Exception as e:
             self.status_item.title = "Status: Error loading model"
             print(f"Model load error: {e}")

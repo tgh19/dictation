@@ -26,13 +26,22 @@ mkdir -p "$MACOS" "$RESOURCES"
 cp dictate.py "$RESOURCES/"
 cp AppIcon.icns "$RESOURCES/"
 
-# Create launcher script
+# Create launcher script — finds the best Python 3 available
 cat > "$MACOS/Dictation" << 'LAUNCHER'
 #!/bin/bash
 # Launch dictation — bootstraps its own venv on first run
 DIR="$(cd "$(dirname "$0")" && pwd)"
 RESOURCES="$DIR/../Resources"
-exec /usr/bin/python3 "$RESOURCES/dictate.py"
+
+# Find a Python 3 that can actually install packages (prefer Homebrew)
+for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    if [ -x "$candidate" ]; then
+        PYTHON="$candidate"
+        break
+    fi
+done
+
+exec "$PYTHON" "$RESOURCES/dictate.py"
 LAUNCHER
 chmod +x "$MACOS/Dictation"
 
