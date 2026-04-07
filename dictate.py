@@ -266,12 +266,24 @@ class DictationApp(rumps.App):
     # ── Whisper ──────────────────────────────────────────────────────
 
     def _load_whisper(self):
-        self.status_item.title = f"Loading {self.whisper_key}..."
+        repo = WHISPER_MODELS[self.whisper_key]
+        self.title = "⏳"
+        self.status_item.title = f"Downloading {self.whisper_key}..."
         try:
-            import mlx_whisper  # noqa: F401
+            import mlx_whisper
+            # Warm up with silent audio to trigger model download + compilation
+            silent = np.zeros(SAMPLE_RATE, dtype=np.float32)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                _write_wav(f.name, silent)
+                try:
+                    mlx_whisper.transcribe(f.name, path_or_hf_repo=repo)
+                finally:
+                    os.unlink(f.name)
             self.model_ready = True
+            self.title = self._idle_icon()
             self._set_ready()
         except Exception:
+            self.title = "⚠️"
             self.status_item.title = "Error loading model"
 
     # ── Keyboard ─────────────────────────────────────────────────────
