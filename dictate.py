@@ -18,9 +18,17 @@ import subprocess
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VENV_DIR = os.path.join(SCRIPT_DIR, ".venv")
+
+# When running from .app bundle, store data in Application Support
+if ".app/Contents" in SCRIPT_DIR:
+    DATA_DIR = os.path.expanduser("~/Library/Application Support/Dictation")
+    os.makedirs(DATA_DIR, exist_ok=True)
+else:
+    DATA_DIR = SCRIPT_DIR
+
+VENV_DIR = os.path.join(DATA_DIR, ".venv")
 VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
-MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
+MODELS_DIR = os.path.join(DATA_DIR, "models")
 
 REQUIRED_PACKAGES = [
     "mlx-whisper",
