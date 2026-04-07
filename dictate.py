@@ -38,6 +38,8 @@ REQUIRED_PACKAGES = [
     "rumps",
     "ctranslate2",
     "transformers",
+    "sentencepiece",
+    "protobuf",
 ]
 
 
@@ -491,7 +493,7 @@ class DictationApp(rumps.App):
             try:
                 self._load_opus_model(src, tgt)
             except Exception as e:
-                print(f"Failed to load translation model {src}→{tgt}: {e}")
+                import traceback; traceback.print_exc()
                 rumps.notification(
                     "Dictation", "Translation model error",
                     f"Could not load {src}→{tgt} model. Check internet for first download.",
@@ -507,7 +509,7 @@ class DictationApp(rumps.App):
                 tokenizer.convert_tokens_to_ids(result[0].hypotheses[0])
             )
         except Exception as e:
-            print(f"Translation error: {e}")
+            import traceback; traceback.print_exc()
             return None
 
     def _load_opus_model(self, src, tgt):
