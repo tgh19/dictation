@@ -104,8 +104,14 @@ from pynput import keyboard as kb
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-HOTKEY = kb.Key.alt_r
 MAX_RECORDING_SECS = 120
+
+HOTKEYS = {
+    "Right Option (⌥)": kb.Key.alt_r,
+    "Right Command (⌘)": kb.Key.cmd_r,
+    "F5": kb.Key.f5,
+    "F6": kb.Key.f6,
+}
 
 WHISPER_MODELS = {
     "Tiny (fastest)": "mlx-community/whisper-tiny",
@@ -151,6 +157,8 @@ class DictationApp(rumps.App):
         self.whisper_model_key = "Tiny (fastest)"
         self.speak_lang = None  # None = auto-detect
         self.type_lang = "en"
+        self.hotkey_name = "Right Option (⌥)"
+        self.hotkey = HOTKEYS[self.hotkey_name]
 
         self._lock = threading.Lock()
         self.recording = False
@@ -201,6 +209,14 @@ class DictationApp(rumps.App):
             self.type_items[name] = item
             self.type_menu.add(item)
 
+        self.hotkey_menu = rumps.MenuItem("Hotkey")
+        self.hotkey_items = {}
+        for name in HOTKEYS:
+            item = rumps.MenuItem(name, callback=self._select_hotkey)
+            item.state = 1 if name == self.hotkey_name else 0
+            self.hotkey_items[name] = item
+            self.hotkey_menu.add(item)
+
         self.menu = [
             self.status_item,
             None,
@@ -210,6 +226,7 @@ class DictationApp(rumps.App):
             self.model_menu,
             self.speak_menu,
             self.type_menu,
+            self.hotkey_menu,
             None,
             rumps.MenuItem("Quit", callback=lambda _: rumps.quit_application()),
         ]
@@ -239,6 +256,14 @@ class DictationApp(rumps.App):
             self.status_item.title = "Status: Loading model..."
             threading.Thread(target=self._load_whisper, daemon=True).start()
 
+    def _select_hotkey(self, sender):
+        for item in self.hotkey_items.values():
+            item.state = 0
+        sender.state = 1
+        self.hotkey_name = sender.title
+        self.hotkey = HOTKEYS[sender.title]
+        self._update_status_ready()
+
     def _select_speak_lang(self, sender):
         for item in self.speak_items.values():
             item.state = 0
@@ -257,6 +282,9 @@ class DictationApp(rumps.App):
                 self.type_lang = code
                 break
 
+    def _update_status_ready(self):
+        self.status_item.title = f"Status: Ready — Hold {self.hotkey_name} to dictate"
+
     # ── Model Loading ────────────────────────────────────────────────
 
     def _load_whisper(self):
@@ -269,7 +297,7 @@ class DictationApp(rumps.App):
                 _write_wav(f.name, silent)
                 mlx_whisper.transcribe(f.name, path_or_hf_repo=model_repo)
             self.model_ready = True
-            self.status_item.title = "Status: Ready — Hold Right ⌥ to dictate"
+            self._update_status_ready()
             print(f"Whisper model '{self.whisper_model_key}' loaded.")
         except Exception as e:
             self.status_item.title = "Status: Error loading model"
@@ -279,11 +307,11 @@ class DictationApp(rumps.App):
 
     def _keyboard_listener(self):
         def on_press(key):
-            if key == HOTKEY:
+            if key == self.hotkey:
                 self._start_recording()
 
         def on_release(key):
-            if key == HOTKEY and self.recording:
+            if key == self.hotkey and self.recording:
                 threading.Thread(target=self._stop_and_process, daemon=True).start()
 
         with kb.Listener(on_press=on_press, on_release=on_release) as listener:
@@ -392,7 +420,7 @@ class DictationApp(rumps.App):
             if text and text.lower().strip(".,!? ") not in HALLUCINATIONS:
                 print(f"[{elapsed:.2f}s] {text}")
                 _type_text(text)
-                self.status_item.title = "Status: Ready — Hold Right ⌥ to dictate"
+                self._update_status_ready()
             else:
                 self.status_item.title = "Status: No speech detected"
 
