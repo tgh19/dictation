@@ -4,5 +4,3 @@ __pycache__/
 *.pyc
 *.log
 .DS_Store
-Dictation.app/
-AppIcon.iconset/
