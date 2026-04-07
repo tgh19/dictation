@@ -73,6 +73,27 @@ def bootstrap():
 # ── Bootstrap before importing anything heavy ────────────────────────
 bootstrap()
 
+# ── Prevent duplicate instances ──────────────────────────────────────
+LOCK_FILE = os.path.join(DATA_DIR, ".dictation.pid")
+
+def _check_single_instance():
+    if os.path.exists(LOCK_FILE):
+        try:
+            old_pid = int(open(LOCK_FILE).read().strip())
+            os.kill(old_pid, 0)  # Check if running
+            # Still running — kill it so we replace it
+            os.kill(old_pid, 9)
+            import time; time.sleep(0.5)
+        except (ProcessLookupError, ValueError, PermissionError):
+            pass  # Not running, proceed
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    import atexit
+    atexit.register(lambda: os.unlink(LOCK_FILE) if os.path.exists(LOCK_FILE) else None)
+
+_check_single_instance()
+
 # ── Now safe to import ───────────────────────────────────────────────
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["DO_NOT_TRACK"] = "1"
@@ -398,7 +419,6 @@ class DictationApp(rumps.App):
                     os.unlink(wav_path)
 
             if text and text.lower().strip(".,!? ") not in HALLUCINATIONS:
-                print(f"[{elapsed:.2f}s] {text}")
                 _type_text(text)
                 self._update_status_ready()
             else:
