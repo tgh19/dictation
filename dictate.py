@@ -22,7 +22,7 @@ DATA_DIR = (
 VENV_DIR = os.path.join(DATA_DIR, ".venv")
 VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
-PID_FILE = os.path.join(DATA_DIR, ".dictation.pid")
+PID_FILE = os.path.expanduser("~/Library/Application Support/Dictation/.dictation.pid")
 
 PACKAGES = {  # pip name → import name
     "mlx-whisper": "mlx_whisper",
