@@ -1,37 +1,28 @@
 #!/usr/bin/env python3
 """
-Dictation & Translation — macOS menu bar app. Fully offline after first run.
-Hold Right-Option key to record, release to transcribe/translate and type at cursor.
+Dictation & Translation — macOS menu bar app.
+Fully offline after first run. All processing on-device via mlx-whisper + opus-mt.
 
-Features:
-  - Menu bar icon with model selection (tiny/small/medium)
-  - Dictation mode: speak in any language, type what you said
-  - Translation mode: speak in one language, type in another
-  - All processing on-device via mlx-whisper + opus-mt
-
-Just run: python3 dictate.py
-First run bootstraps a venv and downloads models automatically.
+Hold a hotkey to record, release to transcribe/translate and type at cursor.
+Just run: python3 dictate.py — first run bootstraps everything automatically.
 """
 
+import atexit
 import os
 import subprocess
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# When running from .app bundle, store data in Application Support
-if ".app/Contents" in SCRIPT_DIR:
-    DATA_DIR = os.path.expanduser("~/Library/Application Support/Dictation")
-    os.makedirs(DATA_DIR, exist_ok=True)
-else:
-    DATA_DIR = SCRIPT_DIR
-
+DATA_DIR = (
+    os.path.expanduser("~/Library/Application Support/Dictation")
+    if ".app/Contents" in SCRIPT_DIR
+    else SCRIPT_DIR
+)
 VENV_DIR = os.path.join(DATA_DIR, ".venv")
 VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
 
-# pip-name → import-name (only where they differ)
-REQUIRED_PACKAGES = {
+PACKAGES = {  # pip name → import name
     "mlx-whisper": "mlx_whisper",
     "sounddevice": "sounddevice",
     "numpy": "numpy",
@@ -44,59 +35,51 @@ REQUIRED_PACKAGES = {
 }
 
 
-def bootstrap():
-    """Ensure venv and packages are ready. Auto-fixes anything missing."""
+# ── Bootstrap & singleton ───────────────────────────────────────────
+
+def _bootstrap():
+    """Create venv and install packages if needed, then re-exec."""
     if sys.prefix == sys.base_prefix:
         if not os.path.exists(VENV_PYTHON):
             subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
         os.execv(VENV_PYTHON, [VENV_PYTHON, __file__] + sys.argv[1:])
 
-    missing = []
-    for pip_name, import_name in REQUIRED_PACKAGES.items():
-        try:
-            __import__(import_name)
-        except ImportError:
-            missing.append(pip_name)
-
+    missing = [p for p, m in PACKAGES.items() if not _importable(m)]
     if missing:
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip",
-        ])
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "-q", *missing,
-        ])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing])
         os.execv(sys.executable, [sys.executable, __file__] + sys.argv[1:])
 
-    # Model downloading/warm-up happens in background after GUI starts
+
+def _importable(module):
+    try:
+        __import__(module)
+        return True
+    except ImportError:
+        return False
 
 
-# ── Bootstrap before importing anything heavy ────────────────────────
-bootstrap()
-
-# ── Prevent duplicate instances ──────────────────────────────────────
-LOCK_FILE = os.path.join(DATA_DIR, ".dictation.pid")
-
-def _check_single_instance():
-    if os.path.exists(LOCK_FILE):
-        try:
-            old_pid = int(open(LOCK_FILE).read().strip())
-            os.kill(old_pid, 0)  # Check if running
-            # Still running — kill it so we replace it
-            os.kill(old_pid, 9)
-            import time; time.sleep(0.5)
-        except (ProcessLookupError, ValueError, PermissionError):
-            pass  # Not running, proceed
+def _ensure_single_instance():
+    """Kill any previous instance, write our PID."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(LOCK_FILE, "w") as f:
+    pid_file = os.path.join(DATA_DIR, ".dictation.pid")
+    if os.path.exists(pid_file):
+        try:
+            old_pid = int(open(pid_file).read().strip())
+            os.kill(old_pid, 9)
+        except (ProcessLookupError, ValueError, PermissionError, OSError):
+            pass
+    with open(pid_file, "w") as f:
         f.write(str(os.getpid()))
-    import atexit
-    atexit.register(lambda: os.unlink(LOCK_FILE) if os.path.exists(LOCK_FILE) else None)
+    atexit.register(lambda: os.path.exists(pid_file) and os.unlink(pid_file))
 
-_check_single_instance()
 
-# ── Now safe to import ───────────────────────────────────────────────
+_bootstrap()
+_ensure_single_instance()
+
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["DO_NOT_TRACK"] = "1"
+
+# ── Imports (available after bootstrap) ──────────────────────────────
 
 import tempfile
 import threading
@@ -104,12 +87,13 @@ import time
 import wave
 
 import numpy as np
-import sounddevice as sd
 import rumps
+import sounddevice as sd
 from pynput import keyboard as kb
 
+# ── Constants ────────────────────────────────────────────────────────
+
 SAMPLE_RATE = 16000
-CHANNELS = 1
 MAX_RECORDING_SECS = 120
 
 HOTKEYS = {
@@ -142,9 +126,7 @@ LANGUAGES = [
     ("Hindi", "hi"),
 ]
 
-TYPE_LANGUAGES = [lang for lang in LANGUAGES if lang[1] is not None]
-
-HALLUCINATIONS = {
+HALLUCINATIONS = frozenset({
     "thank you", "thank you for watching", "thanks for watching",
     "subscribe", "subscribe to my channel", "please subscribe",
     "like and subscribe", "thank you for listening",
@@ -152,16 +134,17 @@ HALLUCINATIONS = {
     "thanks for watching!", "thank you.",
     "i'm going to go ahead and do that",
     "...", ".", "",
-}
+})
 
+
+# ── App ──────────────────────────────────────────────────────────────
 
 class DictationApp(rumps.App):
     def __init__(self):
         super().__init__("🎙", quit_button=None)
-
         self.mode = "dictation"
-        self.whisper_model_key = "Tiny (fastest)"
-        self.speak_lang = None  # None = auto-detect
+        self.whisper_key = "Tiny (fastest)"
+        self.speak_lang = None
         self.type_lang = "en"
         self.hotkey_name = "Right Option (⌥)"
         self.hotkey = HOTKEYS[self.hotkey_name]
@@ -172,157 +155,151 @@ class DictationApp(rumps.App):
         self.stream = None
         self.busy = False
         self.model_ready = False
-
-        # Translation models loaded on demand
         self.translators = {}
         self.tokenizers = {}
 
         self._build_menu()
-
-        threading.Thread(target=self._keyboard_listener, daemon=True).start()
+        threading.Thread(target=self._listen_keys, daemon=True).start()
         threading.Thread(target=self._load_whisper, daemon=True).start()
 
     # ── Menu ─────────────────────────────────────────────────────────
 
+    def _radio_menu(self, title, options, default, callback):
+        """Build a submenu with radio-style checkmarks."""
+        menu = rumps.MenuItem(title)
+        items = {}
+        for name in options:
+            item = rumps.MenuItem(name, callback=callback)
+            item.state = int(name == default)
+            items[name] = item
+            menu.add(item)
+        return menu, items
+
+    def _select_radio(self, items, sender):
+        for item in items.values():
+            item.state = 0
+        sender.state = 1
+
     def _build_menu(self):
-        self.status_item = rumps.MenuItem("Status: Loading model...")
+        self.status_item = rumps.MenuItem("Loading model...")
 
-        self.dictation_item = rumps.MenuItem("Dictation Mode", callback=self._set_dictation)
-        self.dictation_item.state = 1
-        self.translate_item = rumps.MenuItem("Translation Mode", callback=self._set_translate)
+        self.mode_items = {
+            "Dictation Mode": rumps.MenuItem("Dictation Mode", callback=self._set_mode),
+            "Translation Mode": rumps.MenuItem("Translation Mode", callback=self._set_mode),
+        }
+        self.mode_items["Dictation Mode"].state = 1
 
-        self.model_menu = rumps.MenuItem("Whisper Model")
-        self.model_items = {}
-        for name in WHISPER_MODELS:
-            item = rumps.MenuItem(name, callback=self._select_model)
-            item.state = 1 if name == self.whisper_model_key else 0
-            self.model_items[name] = item
-            self.model_menu.add(item)
-
-        self.speak_menu = rumps.MenuItem("Speak Language")
-        self.speak_items = {}
-        for name, code in LANGUAGES:
-            item = rumps.MenuItem(name, callback=self._select_speak_lang)
-            item.state = 1 if code is None else 0
-            self.speak_items[name] = item
-            self.speak_menu.add(item)
-
-        self.type_menu = rumps.MenuItem("Type Language")
-        self.type_items = {}
-        for name, code in TYPE_LANGUAGES:
-            item = rumps.MenuItem(name, callback=self._select_type_lang)
-            item.state = 1 if code == "en" else 0
-            self.type_items[name] = item
-            self.type_menu.add(item)
-
-        self.hotkey_menu = rumps.MenuItem("Hotkey")
-        self.hotkey_items = {}
-        for name in HOTKEYS:
-            item = rumps.MenuItem(name, callback=self._select_hotkey)
-            item.state = 1 if name == self.hotkey_name else 0
-            self.hotkey_items[name] = item
-            self.hotkey_menu.add(item)
+        self.model_menu, self.model_items = self._radio_menu(
+            "Whisper Model", WHISPER_MODELS, self.whisper_key, self._on_model)
+        self.speak_menu, self.speak_items = self._radio_menu(
+            "Speak Language", dict(LANGUAGES), "Auto-detect", self._on_speak_lang)
+        type_langs = [(n, c) for n, c in LANGUAGES if c]
+        self.type_menu, self.type_items = self._radio_menu(
+            "Type Language", dict(type_langs), "English", self._on_type_lang)
+        self.hotkey_menu, self.hotkey_items = self._radio_menu(
+            "Hotkey", HOTKEYS, self.hotkey_name, self._on_hotkey)
 
         self.menu = [
-            self.status_item,
-            None,
-            self.dictation_item,
-            self.translate_item,
-            None,
-            self.model_menu,
-            self.speak_menu,
-            self.type_menu,
-            self.hotkey_menu,
-            None,
+            self.status_item, None,
+            self.mode_items["Dictation Mode"],
+            self.mode_items["Translation Mode"], None,
+            self.model_menu, self.speak_menu,
+            self.type_menu, self.hotkey_menu, None,
             rumps.MenuItem("Quit", callback=lambda _: rumps.quit_application()),
         ]
 
-    def _set_dictation(self, _):
-        self.mode = "dictation"
-        self.dictation_item.state = 1
-        self.translate_item.state = 0
+    # ── Menu callbacks ───────────────────────────────────────────────
+
+    def _set_mode(self, sender):
+        is_translate = sender.title == "Translation Mode"
+        self.mode = "translate" if is_translate else "dictation"
+        self.mode_items["Dictation Mode"].state = int(not is_translate)
+        self.mode_items["Translation Mode"].state = int(is_translate)
         if not self.recording and not self.busy:
-            self.title = "🎙"
+            self.title = "🌐" if is_translate else "🎙"
 
-    def _set_translate(self, _):
-        self.mode = "translate"
-        self.dictation_item.state = 0
-        self.translate_item.state = 1
-        if not self.recording and not self.busy:
-            self.title = "🌐"
+    def _on_model(self, sender):
+        if sender.title == self.whisper_key:
+            return
+        self._select_radio(self.model_items, sender)
+        self.whisper_key = sender.title
+        self.model_ready = False
+        self.status_item.title = "Loading model..."
+        threading.Thread(target=self._load_whisper, daemon=True).start()
 
-    def _select_model(self, sender):
-        old_key = self.whisper_model_key
-        self.whisper_model_key = sender.title
-        for item in self.model_items.values():
-            item.state = 0
-        sender.state = 1
-        if old_key != sender.title:
-            self.model_ready = False
-            self.status_item.title = "Status: Loading model..."
-            threading.Thread(target=self._load_whisper, daemon=True).start()
+    def _on_speak_lang(self, sender):
+        self._select_radio(self.speak_items, sender)
+        self.speak_lang = dict(LANGUAGES)[sender.title]
 
-    def _select_hotkey(self, sender):
-        for item in self.hotkey_items.values():
-            item.state = 0
-        sender.state = 1
+    def _on_type_lang(self, sender):
+        self._select_radio(self.type_items, sender)
+        self.type_lang = dict((n, c) for n, c in LANGUAGES if c)[sender.title]
+
+    def _on_hotkey(self, sender):
+        self._select_radio(self.hotkey_items, sender)
         self.hotkey_name = sender.title
         self.hotkey = HOTKEYS[sender.title]
-        self._update_status_ready()
+        if self.model_ready:
+            self._set_ready()
 
-    def _select_speak_lang(self, sender):
-        for item in self.speak_items.values():
-            item.state = 0
-        sender.state = 1
-        for name, code in LANGUAGES:
-            if name == sender.title:
-                self.speak_lang = code
-                break
+    def _set_ready(self):
+        self.status_item.title = f"Ready — Hold {self.hotkey_name}"
 
-    def _select_type_lang(self, sender):
-        for item in self.type_items.values():
-            item.state = 0
-        sender.state = 1
-        for name, code in TYPE_LANGUAGES:
-            if name == sender.title:
-                self.type_lang = code
-                break
-
-    def _update_status_ready(self):
-        self.status_item.title = f"Status: Ready — Hold {self.hotkey_name} to dictate"
-
-    # ── Model Loading ────────────────────────────────────────────────
+    # ── Whisper ──────────────────────────────────────────────────────
 
     def _load_whisper(self):
-        self.status_item.title = f"Status: Loading {self.whisper_model_key}..."
+        self.status_item.title = f"Loading {self.whisper_key}..."
         try:
-            import mlx_whisper  # noqa: F401 — ensure module is importable
+            import mlx_whisper  # noqa: F401
             self.model_ready = True
-            self._update_status_ready()
-            print(f"Whisper model '{self.whisper_model_key}' ready.")
+            self._set_ready()
         except Exception as e:
-            self.status_item.title = "Status: Error loading model"
-            print(f"Model load error: {e}")
+            self.status_item.title = "Error loading model"
 
     # ── Keyboard ─────────────────────────────────────────────────────
 
-    def _keyboard_listener(self):
-        def on_press(key):
-            if key == self.hotkey:
-                self._start_recording()
-
-        def on_release(key):
-            if key == self.hotkey and self.recording:
-                threading.Thread(target=self._stop_and_process, daemon=True).start()
-
-        with kb.Listener(on_press=on_press, on_release=on_release) as listener:
+    def _listen_keys(self):
+        with kb.Listener(
+            on_press=lambda k: k == self.hotkey and self._start_recording(),
+            on_release=lambda k: (
+                k == self.hotkey and self.recording
+                and threading.Thread(target=self._process, daemon=True).start()
+            ),
+        ) as listener:
             listener.join()
 
     # ── Recording ────────────────────────────────────────────────────
 
-    def _audio_callback(self, indata, frames, time_info, status):
-        if self.recording:
-            self.audio_chunks.append(indata.copy())
+    def _start_recording(self):
+        with self._lock:
+            if self.recording or self.busy or not self.model_ready:
+                return
+            self.audio_chunks = []
+            self.recording = True
+            try:
+                self.stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                    callback=lambda data, *_: (
+                        self.recording and self.audio_chunks.append(data.copy())
+                    ),
+                    blocksize=1024,
+                )
+                self.stream.start()
+            except Exception:
+                self.recording = False
+                self._close_stream()
+                return
+
+        self.title = "🔴"
+        self.status_item.title = "Recording..."
+        _play_sound("Tink")
+
+        def timeout():
+            time.sleep(MAX_RECORDING_SECS)
+            if self.recording:
+                self._process()
+
+        threading.Thread(target=timeout, daemon=True).start()
 
     def _close_stream(self):
         if self.stream:
@@ -333,43 +310,9 @@ class DictationApp(rumps.App):
                 pass
             self.stream = None
 
-    def _start_recording(self):
-        with self._lock:
-            if self.recording or self.busy or not self.model_ready:
-                return
-            self.audio_chunks = []
-            self.recording = True
-            try:
-                self.stream = sd.InputStream(
-                    samplerate=SAMPLE_RATE,
-                    channels=CHANNELS,
-                    dtype="float32",
-                    callback=self._audio_callback,
-                    blocksize=1024,
-                )
-                self.stream.start()
-            except Exception as e:
-                self.recording = False
-                self._close_stream()
-                print(f"Recording error: {e}")
-                return
+    # ── Processing ───────────────────────────────────────────────────
 
-        self.title = "🔴"
-        self.status_item.title = "Status: Recording..."
-        _play_sound("Tink")
-
-        def _timeout():
-            time.sleep(MAX_RECORDING_SECS)
-            with self._lock:
-                if self.recording:
-                    print(f"Recording hit {MAX_RECORDING_SECS}s limit.")
-            self._stop_and_process()
-
-        threading.Thread(target=_timeout, daemon=True).start()
-
-    # ── Transcription & Translation ──────────────────────────────────
-
-    def _stop_and_process(self):
+    def _process(self):
         with self._lock:
             if not self.recording:
                 return
@@ -380,185 +323,133 @@ class DictationApp(rumps.App):
             self.audio_chunks.clear()
 
         self.title = "⏳"
-        self.status_item.title = "Status: Processing..."
+        self.status_item.title = "Processing..."
         _play_sound("Pop")
 
         try:
             if not chunks:
                 return
-
             audio = np.concatenate(chunks, axis=0).flatten()
-            duration = len(audio) / SAMPLE_RATE
-            if duration < 0.3:
+            if len(audio) / SAMPLE_RATE < 0.3:
                 return
 
-            import mlx_whisper
-            model_repo = WHISPER_MODELS[self.whisper_model_key]
-
-            wav_path = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                    wav_path = f.name
-                _write_wav(wav_path, audio)
-
-                t0 = time.time()
-
-                if self.mode == "dictation":
-                    kw = {"path_or_hf_repo": model_repo, "task": "transcribe"}
-                    if self.speak_lang:
-                        kw["language"] = self.speak_lang
-                    result = mlx_whisper.transcribe(wav_path, **kw)
-                    text = result.get("text", "").strip()
-
-                else:  # translate mode
-                    text = self._process_translation(wav_path, model_repo, mlx_whisper)
-
-                elapsed = time.time() - t0
-            finally:
-                if wav_path and os.path.exists(wav_path):
-                    os.unlink(wav_path)
+            text = self._transcribe(audio)
 
             if text and text.lower().strip(".,!? ") not in HALLUCINATIONS:
                 _type_text(text)
-                self._update_status_ready()
+                self._set_ready()
             else:
-                self.status_item.title = "Status: No speech detected"
-
+                self.status_item.title = "No speech detected"
         except Exception as e:
-            print(f"Error: {e}")
-            self.status_item.title = "Status: Error"
+            self.status_item.title = "Error"
         finally:
             with self._lock:
                 self.busy = False
             self.title = "🌐" if self.mode == "translate" else "🎙"
 
-    def _process_translation(self, wav_path, model_repo, mlx_whisper):
-        """Handle translation mode logic. Returns final text to type."""
-        speak = self.speak_lang
-        target = self.type_lang
+    def _transcribe(self, audio):
+        """Transcribe or translate audio. Returns text to type."""
+        import mlx_whisper
+        repo = WHISPER_MODELS[self.whisper_key]
 
-        if speak == target:
-            # Same language — just transcribe
-            kw = {"path_or_hf_repo": model_repo, "task": "transcribe"}
-            if speak:
-                kw["language"] = speak
-            result = mlx_whisper.transcribe(wav_path, **kw)
-            return result.get("text", "").strip()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = f.name
+        try:
+            _write_wav(wav_path, audio)
 
-        if target == "en":
-            # Any → English: whisper's built-in translate
-            kw = {"path_or_hf_repo": model_repo, "task": "translate"}
-            if speak:
-                kw["language"] = speak
-            result = mlx_whisper.transcribe(wav_path, **kw)
-            return result.get("text", "").strip()
+            if self.mode == "dictation":
+                return self._whisper(mlx_whisper, wav_path, repo, "transcribe")
 
-        # Target is non-English — need opus-mt
-        # Step 1: Get English text
-        if speak == "en":
-            result = mlx_whisper.transcribe(
-                wav_path, path_or_hf_repo=model_repo,
-                task="transcribe", language="en",
-            )
-        else:
-            kw = {"path_or_hf_repo": model_repo, "task": "translate"}
-            if speak:
-                kw["language"] = speak
-            result = mlx_whisper.transcribe(wav_path, **kw)
+            speak, target = self.speak_lang, self.type_lang
+            if speak == target:
+                return self._whisper(mlx_whisper, wav_path, repo, "transcribe")
+            if target == "en":
+                return self._whisper(mlx_whisper, wav_path, repo, "translate")
 
-        english_text = result.get("text", "").strip()
-        if not english_text or english_text.lower().strip(".,!? ") in HALLUCINATIONS:
-            return ""
+            # Non-English target: whisper → English → opus-mt → target
+            task = "transcribe" if speak == "en" else "translate"
+            english = self._whisper(mlx_whisper, wav_path, repo, task,
+                                    lang="en" if speak == "en" else speak)
+            if not english or english.lower().strip(".,!? ") in HALLUCINATIONS:
+                return ""
+            self.status_item.title = "Translating..."
+            return self._opus_translate(english, "en", target) or english
+        finally:
+            if os.path.exists(wav_path):
+                os.unlink(wav_path)
 
-        # Step 2: Translate English → target via opus-mt
-        self.status_item.title = "Status: Translating..."
-        translated = self._translate_opus(english_text, "en", target)
-        return translated if translated else english_text
+    def _whisper(self, mlx_whisper, wav_path, repo, task, lang=None):
+        kw = {"path_or_hf_repo": repo, "task": task}
+        if lang is None:
+            lang = self.speak_lang
+        if lang:
+            kw["language"] = lang
+        return mlx_whisper.transcribe(wav_path, **kw).get("text", "").strip()
 
-    def _translate_opus(self, text, src, tgt):
-        """Translate using Helsinki-NLP opus-mt models via ctranslate2."""
+    # ── Translation (opus-mt) ────────────────────────────────────────
+
+    def _opus_translate(self, text, src, tgt):
         pair = (src, tgt)
-
         if pair not in self.translators:
             try:
-                self._load_opus_model(src, tgt)
-            except Exception as e:
-                import traceback; traceback.print_exc()
-                rumps.notification(
-                    "Dictation", "Translation model error",
-                    f"Could not load {src}→{tgt} model. Check internet for first download.",
-                )
+                self._load_opus(src, tgt)
+            except Exception:
+                rumps.notification("Dictation", "Translation error",
+                                   f"Could not load {src}→{tgt} model.")
                 return None
 
-        try:
-            translator = self.translators[pair]
-            tokenizer = self.tokenizers[pair]
-            tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
-            result = translator.translate_batch([tokens])
-            return tokenizer.decode(
-                tokenizer.convert_tokens_to_ids(result[0].hypotheses[0])
-            )
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            return None
+        tokenizer = self.tokenizers[pair]
+        tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
+        result = self.translators[pair].translate_batch([tokens])
+        return tokenizer.decode(
+            tokenizer.convert_tokens_to_ids(result[0].hypotheses[0]))
 
-    def _load_opus_model(self, src, tgt):
-        """Download (if needed) and load an opus-mt translation model."""
+    def _load_opus(self, src, tgt):
         import ctranslate2
         from transformers import MarianTokenizer
 
-        hf_name = f"Helsinki-NLP/opus-mt-{src}-{tgt}"
         os.makedirs(MODELS_DIR, exist_ok=True)
-
         model_dir = os.path.join(MODELS_DIR, f"opus-mt-{src}-{tgt}")
         tok_dir = os.path.join(MODELS_DIR, f"tokenizer-{src}-{tgt}")
+        hf_name = f"Helsinki-NLP/opus-mt-{src}-{tgt}"
 
         if not os.path.exists(model_dir):
-            print(f"Downloading translation model {hf_name}...")
-            converter = ctranslate2.converters.TransformersConverter(hf_name)
-            converter.convert(model_dir, quantization="int8")
-
+            ctranslate2.converters.TransformersConverter(hf_name).convert(
+                model_dir, quantization="int8")
         if not os.path.exists(tok_dir):
-            print(f"Caching tokenizer for {hf_name}...")
-            tok = MarianTokenizer.from_pretrained(hf_name)
-            tok.save_pretrained(tok_dir)
+            MarianTokenizer.from_pretrained(hf_name).save_pretrained(tok_dir)
 
         pair = (src, tgt)
         self.translators[pair] = ctranslate2.Translator(model_dir, device="cpu")
         self.tokenizers[pair] = MarianTokenizer.from_pretrained(tok_dir)
-        print(f"Translation model {src}→{tgt} loaded.")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
-def _write_wav(path, audio_data):
-    audio_int16 = (audio_data * 32767).astype(np.int16)
+def _write_wav(path, audio):
     with wave.open(path, "wb") as wf:
-        wf.setnchannels(CHANNELS)
+        wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio_int16.tobytes())
+        wf.writeframes((audio * 32767).astype(np.int16).tobytes())
 
 
 def _type_text(text):
-    """Type text at cursor position via clipboard paste (restores clipboard after)."""
     text = text.strip()
     if not text:
         return
-    old_clip = subprocess.run(["pbpaste"], capture_output=True, timeout=5).stdout
+    old = subprocess.run(["pbpaste"], capture_output=True, timeout=5).stdout
     subprocess.run(["pbcopy"], input=text.encode(), check=True, timeout=5)
-    subprocess.run(
-        ["osascript", "-e",
-         'tell application "System Events" to keystroke "v" using command down'],
-        capture_output=True, timeout=5,
-    )
+    subprocess.run(["osascript", "-e",
+                     'tell application "System Events" to keystroke "v" using command down'],
+                    capture_output=True, timeout=5)
     time.sleep(0.1)
-    subprocess.run(["pbcopy"], input=old_clip, check=True, timeout=5)
+    subprocess.run(["pbcopy"], input=old, check=True, timeout=5)
 
 
 def _play_sound(name):
-    path = f"/System/Library/Sounds/{name}.aiff"
-    subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(["afplay", f"/System/Library/Sounds/{name}.aiff"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":
