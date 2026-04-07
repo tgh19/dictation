@@ -259,13 +259,15 @@ class DictationApp(rumps.App):
     # ── Keyboard ─────────────────────────────────────────────────────
 
     def _listen_keys(self):
-        with kb.Listener(
-            on_press=lambda k: k == self.hotkey and self._start_recording(),
-            on_release=lambda k: (
-                k == self.hotkey and self.recording
-                and threading.Thread(target=self._process, daemon=True).start()
-            ),
-        ) as listener:
+        def on_press(key):
+            if key == self.hotkey:
+                self._start_recording()
+
+        def on_release(key):
+            if key == self.hotkey and self.recording:
+                threading.Thread(target=self._process, daemon=True).start()
+
+        with kb.Listener(on_press=on_press, on_release=on_release) as listener:
             listener.join()
 
     # ── Recording ────────────────────────────────────────────────────
@@ -279,10 +281,7 @@ class DictationApp(rumps.App):
             try:
                 self.stream = sd.InputStream(
                     samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                    callback=lambda data, *_: (
-                        self.recording and self.audio_chunks.append(data.copy())
-                    ),
-                    blocksize=1024,
+                    callback=self._audio_cb, blocksize=1024,
                 )
                 self.stream.start()
             except Exception:
@@ -300,6 +299,10 @@ class DictationApp(rumps.App):
                 self._process()
 
         threading.Thread(target=timeout, daemon=True).start()
+
+    def _audio_cb(self, indata, frames, time_info, status):
+        if self.recording:
+            self.audio_chunks.append(indata.copy())
 
     def _close_stream(self):
         if self.stream:
